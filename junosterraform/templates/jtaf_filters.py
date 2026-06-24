@@ -14,21 +14,19 @@ Merge directives:
   _merge_directive: "keep_parent"       # Use parent, ignore this override
 """
 
-from copy import deepcopy
-from typing import Any, Dict, Optional
-
 try:
     from ansible.errors import AnsibleFilterError
 except ImportError:
     class AnsibleFilterError(Exception):
-        """Fallback error type when ansible is not installed."""
+        """Fallback filter error when ansible is unavailable."""
+from copy import deepcopy
+from typing import Any, Dict, Optional
 
 
 class FilterModule:
     """JTAF filters for Ansible."""
 
     def filters(self):
-        """Return the filter-name to callable mapping for Ansible registration."""
         return {
             'jtaf_apply_merge_directives': self.apply_merge_directives,
             'jtaf_extract_directive': self.extract_directive,
@@ -104,18 +102,37 @@ class FilterModule:
         return data
 
 
-def _merge_replace(_base: Any, override: Any) -> Any:
-    """Always return override value."""
+def _dispatch_merge(base: Any, override: Any, directive: Optional[str] = None) -> Any:
+    directive = directive or 'replace'
+
+    handlers = {
+        'replace': _merge_replace,
+        'keep_parent': _merge_keep_parent,
+        'merge_recursive': _merge_recursive,
+        'append': _merge_append,
+        'prepend': _merge_prepend,
+        'extend': _merge_extend,
+    }
+
+    try:
+        handler = handlers[directive]
+    except KeyError as exc:
+        raise AnsibleFilterError(f"Unknown merge directive: {directive}") from exc
+
+    return handler(base, override)
+
+
+def _merge_replace(base: Any, override: Any) -> Any:
+    del base
     return override
 
 
-def _merge_keep_parent(base: Any, _override: Any) -> Any:
-    """Always keep parent/base value."""
+def _merge_keep_parent(base: Any, override: Any) -> Any:
+    del override
     return base
 
 
 def _merge_recursive(base: Any, override: Any) -> Any:
-    """Deep-merge dicts, otherwise return override."""
     if isinstance(base, dict) and isinstance(override, dict):
         result = deepcopy(base)
         result.update(override)
@@ -124,7 +141,6 @@ def _merge_recursive(base: Any, override: Any) -> Any:
 
 
 def _merge_append(base: Any, override: Any) -> Any:
-    """Append override to base with list-friendly coercion."""
     if isinstance(base, list) and isinstance(override, list):
         return base + override
     if isinstance(base, list):
@@ -133,7 +149,6 @@ def _merge_append(base: Any, override: Any) -> Any:
 
 
 def _merge_prepend(base: Any, override: Any) -> Any:
-    """Prepend override to base with list-friendly coercion."""
     if isinstance(base, list) and isinstance(override, list):
         return override + base
     if isinstance(base, list):
@@ -142,23 +157,12 @@ def _merge_prepend(base: Any, override: Any) -> Any:
 
 
 def _merge_extend(base: Any, override: Any) -> Any:
-    """Strict list-only append operation."""
     if not isinstance(base, list) or not isinstance(override, list):
         raise AnsibleFilterError(
             f"'extend' directive requires both values to be lists, "
             f"got {type(base).__name__} and {type(override).__name__}"
         )
     return base + override
-
-
-DIRECTIVE_HANDLERS = {
-    'replace': _merge_replace,
-    'keep_parent': _merge_keep_parent,
-    'merge_recursive': _merge_recursive,
-    'append': _merge_append,
-    'prepend': _merge_prepend,
-    'extend': _merge_extend,
-}
 
 
 def jtaf_merge_with_directive(base: Any, override: Any, directive: Optional[str] = None) -> Any:
@@ -173,8 +177,4 @@ def jtaf_merge_with_directive(base: Any, override: Any, directive: Optional[str]
     Returns:
         Merged value
     """
-    normalized = directive or 'replace'
-    handler = DIRECTIVE_HANDLERS.get(normalized)
-    if handler is None:
-        raise AnsibleFilterError(f"Unknown merge directive: {normalized}")
-    return handler(base, override)
+    return _dispatch_merge(base, override, directive)

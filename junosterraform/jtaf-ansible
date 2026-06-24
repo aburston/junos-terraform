@@ -90,30 +90,26 @@ def main() -> None:
 
     # write a merge-aware tasks/main.yml
     tasks_main = """---
-# Hierarchical variable merging with automatic device type detection.
-# Merge order: global (all) -> device_type -> host
+# Hierarchical variable merging.
+# Merge order: group_vars/all.yml -> group_vars/<type>/all.yml -> host_vars/<host>.yml
 # with optional _merge_directive meta-instructions for custom behavior.
 
-# Build the effective config from Ansible-resolved vars.
-# Ansible already applies precedence across group_vars/host_vars; filter out
-# runtime/meta keys that are not part of device configuration.
+# Build the effective config from pre_tasks-loaded facts and task-scope vars.
+# Pre_tasks load canonical hierarchy from ansible_files into jtaf_group_all, jtaf_group_merged, jtaf_host_vars.
+# This step builds only from explicit hierarchy layers to avoid host var precedence overrides.
 - name: Merge variables from hierarchy
   set_fact:
     jtaf_effective: >-
       {{{{
-                vars
-                | dict2items
-                | rejectattr('key', 'match', '^(ansible_.*|inventory_.*|role_.*)$')
-                | rejectattr('key', 'in', ['group_names', 'groups', 'group_vars', 'hostvars'])
-                | rejectattr('key', 'in', ['omit', 'playbook_dir', 'tmp_dir', 'jtaf_effective'])
-                | items2dict
+        jtaf_group_all | combine(jtaf_group_merged, recursive=True, list_merge='append')
+        | combine(jtaf_host_vars, recursive=True, list_merge='append')
       }}}}
   tags: [merge_vars]
 
 # Handle _merge_directive meta-instructions for custom merge behavior
 - name: Apply custom merge directives
   set_fact:
-    jtaf_effective: "{{{{ jtaf_effective | jtaf_apply_merge_directives }}}}"
+    jtaf_effective: "{{{{ jtaf_effective | jtaf_apply_merge_directives | jtaf_remove_meta }}}}"
   when: jtaf_effective is defined
   tags: [merge_directives]
 
@@ -125,7 +121,7 @@ def main() -> None:
 
     # write group_vars/all.yml — common defaults shared by all hosts
     group_vars_all = """# Common configuration for all hosts managed by this JTAF Ansible role.
-# Values here are overridden by group_vars/device_<type>/all.yml, then host_vars/<host>.yml.
+# Values here are overridden by group_vars/<type>/all.yml, then host_vars/<host>.yml.
 # No JTAF-specific wrapper containers are required.
 """
     with open(os.path.join(new_dir, "group_vars", "all.yml"), "w") as f:
@@ -144,13 +140,40 @@ def main() -> None:
     with open(os.path.join(templates_path, "template.j2"), "w") as f:
         f.write(resource_config_provider_j2)
 
-    # Step 4: Create a minimal ansible playbook
+    # Step 4: Create ansible playbook with pre_tasks for loading canonical hierarchy
     playbook_content = f"""- name: Apply Junos configuration
   hosts: all
   connection: local
   gather_facts: no
   vars:
     tmp_dir: "configs"
+    jtaf_vars_root: "{{{{ playbook_dir }}}}/../ansible_files"
+  pre_tasks:
+    - name: Initialize explicit variable layers
+      set_fact:
+        jtaf_group_all: {{}}
+        jtaf_group_merged: {{}}
+        jtaf_host_vars: {{}}
+    - name: Load global group vars from ansible_files
+      set_fact:
+        jtaf_group_all: "{{{{ lookup('file', jtaf_group_all_file) | from_yaml }}}}"
+      vars:
+        jtaf_group_all_file: "{{{{ jtaf_vars_root }}}}/group_vars/all.yaml"
+      when: (query('ansible.builtin.fileglob', jtaf_group_all_file) | length) > 0
+    - name: Merge group vars for each inventory group
+      set_fact:
+        jtaf_group_merged: "{{{{ jtaf_group_merged | combine(lookup('file', jtaf_group_file) | from_yaml, recursive=True, list_merge='append') }}}}"
+      vars:
+        jtaf_group_file: "{{{{ jtaf_vars_root }}}}/group_vars/{{{{ item }}}}/all.yaml"
+      loop: "{{{{ group_names }}}}"
+      when: (query('ansible.builtin.fileglob', jtaf_group_file) | length) > 0
+    - name: Locate host vars file
+      set_fact:
+        jtaf_host_file: "{{{{ (query('ansible.builtin.fileglob', jtaf_vars_root + '/host_vars/' + inventory_hostname + '.y*ml') | sort | first) | default('', true) }}}}"
+    - name: Load host vars from ansible_files
+      set_fact:
+        jtaf_host_vars: "{{{{ lookup('file', jtaf_host_file) | from_yaml }}}}"
+      when: jtaf_host_file | length > 0
   roles:
     - role: {role_name}
       delegate_to: localhost

@@ -220,7 +220,9 @@ provider "junos-vqfx" {
 }
 ```
 
-You can either specify the exact IP address in the host field OR use a hostname (like in the example above) and provide the IP address for every hostname in the system file `/etc/hosts`.
+You can either specify the exact IP address in the host field OR use a hostname (like in the example above) and provide the IP address for every hostname in the system file `/etc/hosts` using `vi`.
+
+*NOTE:* If the `/etc/hosts` file is a **READ-ONLY** file, then try using `sudo su` then re-run `vi /etc/hosts`. Exit after editing and return back to user control. 
 
 Example:
 ```
@@ -284,7 +286,7 @@ jtaf-yang2ansible -p <path-to-common> <path-to-yang-files> -x <xml-config(s)> -t
 
 Example:
 ```
-jtaf-yang2ansible -p examples/yang/18.2/18.2R3/common examples/yang/18.2/18.2R3/junos-qfx/conf/*.yang -x examples/evpn-vxlan-dc/dc1/*spine*.xml -t qfx
+jtaf-yang2ansible -p examples/yang/18.2/18.2R3/common examples/yang/18.2/18.2R3/junos-qfx/conf/*.yang -x examples/evpn-vxlan-dc/dc1/*spine*.xml -t vqfx
 ```
 
 Notes:
@@ -306,38 +308,35 @@ Merge behavior for shared + host-specific vars:
 Convert one or more Junos XML configs into Ansible `host_vars`, `group_vars`, and inventory data.
 
 Important behavior:
-- The run is expected to represent a single generated role type.
-- Device type for grouping comes from `-t/--type` (or inferred from `ansible-provider-junos-<type>/trimmed_schema.json` path), not from XML content.
+- Each run should use one `trimmed_schema.json` and matching XML configs for the generated role.
+- `--grouping-hosts-file` is required.
+- Inventory groups and optional `:children` sections come from the `grouping.hosts` file, not from a `-t/--type` flag.
 - Output can be split across directories so generated role location and provisioning playbook location can differ.
-- Repeated runs are merge-safe:
-  - `group_vars/all.yml` is merged with first-writer-wins at top-level keys.
-  - Conflicting top-level keys are written to `group_vars/<type>/all.yml` for type-specific override.
+- Repeated runs are merge-safe when they reuse the same `-d/--directory` output directory:
+  - `group_vars/all.yaml` stores values shared across all hosts currently tracked in that output directory.
+  - `group_vars/<group>/all.yaml` stores per-group deltas for the groups defined in `grouping.hosts`.
+  - Host-specific differences are preserved in each `host_vars/<host>.yaml` file.
   - Existing inventory hosts/groups are merged (not clobbered).
 
 Usage:
 ```
-jtaf-xml2yaml -j <trimmed_schema.json> -x <config1.xml> [<config2.xml> ...] -d <output-dir> -t <device-type>
+jtaf-xml2yaml -j <trimmed_schema.json> -x <config1.xml> [<config2.xml> ...] -d <output-dir> --grouping-hosts-file <grouping_hosts_file>
 
-# Write inventory/vars into a separate playbook workspace
-jtaf-xml2yaml -j <trimmed_schema.json> -x <config1.xml> [<config2.xml> ...] -d <role-output-dir> -t <device-type> \
-  --hosts-file <playbook-dir>/inventory/hosts.ini \
-  --group-vars-dir <playbook-dir>/group_vars \
-  --host-vars-dir <playbook-dir>/host_vars
 ```
 
 Example:
 ```
-jtaf-xml2yaml -j ansible-provider-junos-qfx/trimmed_schema.json \
-	-x examples/evpn-vxlan-dc/dc1/dc1-leaf1.xml examples/evpn-vxlan-dc/dc1/dc1-leaf2.xml \
-  -d ansible-provider-junos-qfx \
-  -t qfx
+jtaf-xml2yaml -j ansible-provider-junos-vqfx/trimmed_schema.json \
+	-x examples/evpn-vxlan-dc/dc1/dc1-leaf1.xml examples/evpn-vxlan-dc/dc1/dc1-spine1.xml \
+  -d ansible_files \
+  --grouping-hosts-file examples/ansible/switches_grouping_hosts
 ```
 
 Output:
 - Creates `host_vars/<hostname>.yaml` for every XML file provided (hostname is file base name or `system/host-name` from XML).
-- Maintains `group_vars/all.yml` for global shared keys (first writer wins across runs).
-- Writes conflicting top-level shared keys into `group_vars/<type>/all.yml`.
-- Writes/updates inventory hosts file with `[all]` and `[device_<type>]` groups.
+- Writes `group_vars/all.yaml` for keys shared across all tracked hosts in the output directory.
+- Writes `group_vars/<group>/all.yaml` for each group defined in `grouping.hosts`.
+- Writes/updates inventory hosts file with `[all]`, `[group]`, and `[group:children]` sections taken from `grouping.hosts`.
 
 This output feeds into the Ansible role/playbook created by jtaf-ansible/jtaf-yang2ansible.
 
@@ -352,9 +351,13 @@ This walkthrough is for first-time Ansible users and reflects the recommended sp
 
 1. Install Ansible dependencies on your control node
 
+Note that Ansible must be installed in the virtual environment (venv). Additionally, the following system packages and Python modules are required:
+
 ```bash
 python -m pip install --upgrade pip
-python -m pip install -r .github/requirements/ansible-test-requirements.txt
+sudo dnf install ansible -y
+sudo dnf install python3-pip -y
+/usr/bin/python3 -m pip install ncclient junos-eznc jxmlease
 
 # Install Juniper collection used to push config.
 ansible-galaxy collection install juniper.device
@@ -408,49 +411,108 @@ host_key_checking = False
 
 For first-time Ansible users: `roles_path` tells Ansible where custom roles live. In this workflow, both generated roles are referenced, while your operator playbook stays in `ansible-evpn-vxlan-deploy/`.
 
-5. Generate inventory + vars for the first role into the playbook project
+5. Create `grouping.hosts` files for the inventory hierarchy
 
-Generate `hosts`, `group_vars`, and `host_vars` into your playbook directory while keeping the role output separate:
+`jtaf-xml2yaml` now requires a grouping definition. The section names in these files become your generated inventory groups and `group_vars/<group>/all.yaml` directories.
 
+Create `ansible-evpn-vxlan-deploy/qfx.grouping.hosts`:
+
+```ini
+[all]
+dc1-borderleaf1
+dc1-borderleaf2
+dc1-leaf1
+dc1-leaf2
+dc1-leaf3
+dc1-spine1
+dc1-spine2
+dc2-spine1
+dc2-spine2
+
+[borderleaf]
+dc1-borderleaf1
+dc1-borderleaf2
+
+[leaf]
+dc1-leaf1
+dc1-leaf2
+dc1-leaf3
+
+[spine]
+dc1-spine1
+dc1-spine2
+dc2-spine1
+dc2-spine2
 ```
+
+Create `ansible-evpn-vxlan-deploy/firewall.grouping.hosts`:
+
+```ini
+[all]
+dc1-firewall1
+dc1-firewall2
+dc2-firewall1
+dc2-firewall2
+
+[firewall]
+dc1-firewall1
+dc1-firewall2
+dc2-firewall1
+dc2-firewall2
+```
+
+6. Generate inventory + vars for the first role into the playbook project
+
+Use the same `-d` directory for every `jtaf-xml2yaml` run that should share one inventory, `group_vars`, `host_vars`, and payload cache.
+
+```bash
 jtaf-xml2yaml \
 	-x examples/evpn-vxlan-dc/dc1/*{spine,leaf}*.xml examples/evpn-vxlan-dc/dc2/*spine*.xml \
 	-j ansible-provider-junos-vqfx-evpn-vxlan/trimmed_schema.json \
-  -d ansible-provider-junos-vqfx-evpn-vxlan \
-  -t vqfx-evpn-vxlan \
+  -d ansible-evpn-vxlan-deploy \
   --hosts-file ansible-evpn-vxlan-deploy/inventory.ini \
-  --group-vars-dir ansible-evpn-vxlan-deploy/group_vars \
-  --host-vars-dir ansible-evpn-vxlan-deploy/host_vars
+  --grouping-hosts-file ansible-evpn-vxlan-deploy/qfx.grouping.hosts
 ```
 
-6. Generate inventory + vars for the second role into the same playbook project
+7. Generate inventory + vars for the second role into the same playbook project
 
 ```bash
 jtaf-xml2yaml \
   -x examples/evpn-vxlan-dc/dc1/dc1-*firewall*.xml examples/evpn-vxlan-dc/dc2/dc2-*firewall*.xml \
   -j ansible-provider-junos-srx-ansible-role/trimmed_schema.json \
-  -d ansible-provider-junos-srx-ansible-role \
-  -t srx-ansible-role \
+  -d ansible-evpn-vxlan-deploy \
   --hosts-file ansible-evpn-vxlan-deploy/inventory.ini \
-  --group-vars-dir ansible-evpn-vxlan-deploy/group_vars \
-  --host-vars-dir ansible-evpn-vxlan-deploy/host_vars
+  --grouping-hosts-file ansible-evpn-vxlan-deploy/firewall.grouping.hosts
 ```
 
-Update `ansible-evpn-vxlan-deploy/inventory.ini` with reachable management addresses:
+After both runs, your playbook project should contain at least:
+- `inventory.ini`
+- `group_vars/all.yaml`
+- `group_vars/borderleaf/all.yaml`
+- `group_vars/leaf/all.yaml`
+- `group_vars/spine/all.yaml`
+- `group_vars/firewall/all.yaml`
+- `host_vars/<hostname>.yaml`
+
+Update `ansible-evpn-vxlan-deploy/inventory.ini` with reachable management addresses while keeping the generated group names:
 
 ```ini
-[evpn_vxlan]
+[borderleaf]
 dc1-borderleaf1 ansible_host=192.0.2.101 ansible_port=830
 dc1-borderleaf2 ansible_host=192.0.2.102 ansible_port=830
+
+[leaf]
 dc1-leaf1 ansible_host=192.0.2.11 ansible_port=830
 dc1-leaf2 ansible_host=192.0.2.12 ansible_port=830
 dc1-leaf3 ansible_host=192.0.2.13 ansible_port=830
+
+[spine]
 dc1-spine1 ansible_host=192.0.2.21 ansible_port=830
 dc1-spine2 ansible_host=192.0.2.22 ansible_port=830
 dc2-spine1 ansible_host=192.0.2.31 ansible_port=830
 dc2-spine2 ansible_host=192.0.2.32 ansible_port=830
 
-[evpn_firewall]
+[firewall]
 dc1-firewall1 ansible_host=192.0.2.201 ansible_port=830
 dc1-firewall2 ansible_host=192.0.2.202 ansible_port=830
 dc2-firewall1 ansible_host=192.0.2.203 ansible_port=830
@@ -458,17 +520,19 @@ dc2-firewall2 ansible_host=192.0.2.204 ansible_port=830
 ```
 
 Notes on repeated runs:
-- If you run `jtaf-xml2yaml` again for another generated role, `group_vars/all.yml` is merged, not overwritten.
-- If the same top-level key conflicts, existing `all.yml` value stays, and the new value is written under `group_vars/<type>/all.yml`.
+- Reuse the same `-d` directory whenever you want one merged inventory and var tree.
+- `group_vars/all.yaml` contains values shared across every tracked host in that output directory.
+- `group_vars/<group>/all.yaml` contains per-group deltas for groups declared in the relevant `grouping.hosts` file.
+- Host-specific differences remain in `host_vars/<hostname>.yaml`.
 
-7. Create a playbook that renders, previews diff, pushes, and verifies
+8. Create a playbook that renders, previews diff, pushes, and verifies
 
 Create `ansible-evpn-vxlan-deploy/site.yml`:
 
 ```yaml
 ---
-- name: Render XML from generated role
-  hosts: evpn_vxlan
+- name: Render XML from generated QFX role
+  hosts: borderleaf:leaf:spine
   gather_facts: false
   connection: local
   vars:
@@ -478,7 +542,7 @@ Create `ansible-evpn-vxlan-deploy/site.yml`:
       delegate_to: localhost
 
 - name: Render XML from generated SRX role
-  hosts: evpn_firewall
+  hosts: firewall
   gather_facts: false
   connection: local
   vars:
@@ -487,8 +551,8 @@ Create `ansible-evpn-vxlan-deploy/site.yml`:
     - role: srx-ansible-role_role
       delegate_to: localhost
 
-- name: Preview and apply rendered XML on Junos devices
-  hosts: evpn_vxlan
+- name: Preview and apply rendered XML on QFX devices
+  hosts: borderleaf:leaf:spine
   gather_facts: false
   connection: local
   vars:
@@ -551,7 +615,7 @@ Create `ansible-evpn-vxlan-deploy/site.yml`:
           - "confirm={{ confirm_result.msg | default('no message') }}"
 
 - name: Preview and apply rendered XML on SRX devices
-  hosts: evpn_firewall
+  hosts: firewall
   gather_facts: false
   connection: local
   vars:
@@ -586,7 +650,7 @@ Create `ansible-evpn-vxlan-deploy/site.yml`:
       register: apply_result_srx
 ```
 
-8. Run the playbook
+9. Run the playbook
 
 ```bash
 cd ansible-evpn-vxlan-deploy
@@ -598,9 +662,9 @@ export NETCONF_PASSWORD='<junos-netconf-password>'
 ansible-playbook -i inventory.ini site.yml
 ```
 
-9. What to check in output
+10. What to check in output
 
-- The preview tasks should show diffs for both groups (`evpn_vxlan` and `evpn_firewall`).
+- The preview tasks should show diffs for the generated switch groups (`borderleaf`, `leaf`, and `spine`) and for `firewall`.
 - The apply tasks should succeed for both generated roles.
 - Inventory and vars should remain merged across repeated `jtaf-xml2yaml` runs.
 

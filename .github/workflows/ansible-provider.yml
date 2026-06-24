@@ -16,10 +16,10 @@ jobs:
         python-version: ["3.10", "3.x"]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: ${{ matrix.python-version }}
 
@@ -67,7 +67,8 @@ jobs:
         jtaf-xml2yaml \
           -x examples/evpn-vxlan-dc/dc1/*{spine,leaf}*.xml examples/evpn-vxlan-dc/dc2/*spine*.xml \
           -j ansible-provider-junos-vqfx-evpn-vxlan/trimmed_schema.json \
-          -d ci-evpn-vxlan-ansible
+          -d ci-evpn-vxlan-ansible \
+          --grouping-hosts-file .github/ansible/ci-switches-grouping.hosts
 
     - name: Prepare generated role and CI playbook
       run: |
@@ -308,7 +309,7 @@ jobs:
 
     - name: Upload Ansible and NETCONF integration logs
       if: always() && env.ACT != 'true'
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@v7
       with:
         name: ansible-netconf-integration-logs-${{ matrix.python-version }}
         path: |
