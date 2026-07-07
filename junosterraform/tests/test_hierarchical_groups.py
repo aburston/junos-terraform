@@ -359,13 +359,15 @@ def test_xml2yaml_main_multi_provider_shared_all_yaml(xml2yaml_mod, tmp_path, mo
     xml2yaml_mod.main()
 
     all_payload = yaml.safe_load((out_dir / "group_vars" / "all.yaml").read_text())
-    registry = all_payload["meta"]["jtaf_registry"]
+    registry_payload = yaml.safe_load((out_dir / "group_vars" / "registry.yaml").read_text())
+    registry = registry_payload["meta"]["jtaf_registry"]
     qfx_entry = registry["providers"]["vqfx-ansible-role_role"]
     srx_entry = registry["providers"]["srx-ansible-role_role"]
 
     assert set(registry["providers"].keys()) == {"vqfx-ansible-role_role", "srx-ansible-role_role"}
     assert all_payload["system"]["services"]["ssh"] is True
     assert "product_name" not in all_payload["system"]
+    assert "meta" not in all_payload
 
     qfx_range = qfx_entry["group_range"]
     srx_range = srx_entry["group_range"]
@@ -408,7 +410,9 @@ def test_xml2yaml_main_removes_old_owned_groups_on_rerun(xml2yaml_mod, tmp_path,
     xml2yaml_mod.main()
 
     first_all = yaml.safe_load((out_dir / "group_vars" / "all.yaml").read_text())
-    first_entry = first_all["meta"]["jtaf_registry"]["providers"]["vqfx-ansible-role_role"]
+    first_registry = yaml.safe_load((out_dir / "group_vars" / "registry.yaml").read_text())
+    first_entry = first_registry["meta"]["jtaf_registry"]["providers"]["vqfx-ansible-role_role"]
+    assert "meta" not in first_all
     assert first_entry["group_names"]
     first_root_path = out_dir / "group_vars" / first_entry["group_paths"][first_entry["root_group"]]
     assert first_root_path.exists()
@@ -423,7 +427,9 @@ def test_xml2yaml_main_removes_old_owned_groups_on_rerun(xml2yaml_mod, tmp_path,
     xml2yaml_mod.main()
 
     second_all = yaml.safe_load((out_dir / "group_vars" / "all.yaml").read_text())
-    second_entry = second_all["meta"]["jtaf_registry"]["providers"]["vqfx-ansible-role_role"]
+    second_registry = yaml.safe_load((out_dir / "group_vars" / "registry.yaml").read_text())
+    second_entry = second_registry["meta"]["jtaf_registry"]["providers"]["vqfx-ansible-role_role"]
+    assert "meta" not in second_all
     assert second_entry.get("group_names", []) == []
     assert not first_root_path.exists()
 

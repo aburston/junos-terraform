@@ -139,7 +139,7 @@ META_KEY = "meta"
 REGISTRY_KEY = "jtaf_registry"
 PROVIDERS_KEY = "providers"
 ALL_YAML = "all.yaml"
-ALL_YML = "all.yml"
+REGISTRY_FILE = "registry.yaml"
 
 
 def _plain_group_name(name: str) -> str:
@@ -677,20 +677,16 @@ def normalize_registry(raw_registry: Any) -> dict[str, Any]:
 
 
 def load_shared_all_state(group_vars_root: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Load shared all.yaml and split into payload and registry metadata."""
-    all_file = os.path.join(group_vars_root, ALL_YAML)
-    if not os.path.exists(all_file):
-        all_file = os.path.join(group_vars_root, ALL_YML)
-    payload = load_yaml_file(all_file)
-    meta, non_meta = split_meta_payload(payload)
-    registry = normalize_registry(meta.get(REGISTRY_KEY, {}))
-    return non_meta, registry
+    """Load shared all.yaml (config) and registry.yaml (tool state) separately."""
+    config_payload = load_yaml_file(os.path.join(group_vars_root, ALL_YAML))
+    registry_raw = load_yaml_file(os.path.join(group_vars_root, REGISTRY_FILE))
+    registry = normalize_registry(registry_raw.get(META_KEY, {}).get(REGISTRY_KEY, {}))
+    return config_payload, registry
 
 
 def write_group_all_payload(directory: str, payload: dict[str, Any]) -> None:
-    """Write compatibility copies for group all payload files."""
+    """Write group all.yaml payload file."""
     write_yaml_file(os.path.join(directory, ALL_YAML), payload)
-    write_yaml_file(os.path.join(directory, ALL_YML), payload)
 
 
 def write_shared_all_state(
@@ -698,10 +694,12 @@ def write_shared_all_state(
     shared_payload: dict[str, Any],
     registry: dict[str, Any],
 ) -> None:
-    """Persist shared all.yaml payload and registry metadata."""
-    payload = copy.deepcopy(shared_payload)
-    payload[META_KEY] = {REGISTRY_KEY: registry}
-    write_group_all_payload(group_vars_root, payload)
+    """Persist config to all.yaml and tool state to registry.yaml separately."""
+    write_yaml_file(
+        os.path.join(group_vars_root, REGISTRY_FILE),
+        {META_KEY: {REGISTRY_KEY: registry}},
+    )
+    write_group_all_payload(group_vars_root, shared_payload)
 
 
 def build_global_shared_payload_from_registry(registry: dict[str, Any]) -> dict[str, Any]:
@@ -1338,6 +1336,32 @@ def _build_user_groups_from_inventory(
     return common_groups, parent_map, host_to_leaf, errors
 
 
+def _prefix_group_names(
+    common_groups: dict[str, list[str]],
+    parent_map: dict[str, Optional[str]],
+    host_to_leaf: dict[str, str],
+    prefix: str,
+) -> tuple[dict[str, list[str]], dict[str, Optional[str]], dict[str, str]]:
+    """Rename all auto-generated group tokens to include a provider-specific prefix.
+
+    Prevents directory collisions when two providers are processed into the same
+    output directory: both would otherwise auto-generate ``candidate1`` etc.
+    """
+    def _rename(token: str) -> str:
+        if ":" in token:
+            tag, name = token.split(":", 1)
+            return f"{tag}:{prefix}_{name}"
+        return f"{prefix}_{token}"
+
+    new_groups: dict[str, list[str]] = {_rename(k): v for k, v in common_groups.items()}
+    new_parent_map: dict[str, Optional[str]] = {
+        _rename(k): (_rename(v) if v is not None else None)
+        for k, v in parent_map.items()
+    }
+    new_host_to_leaf: dict[str, str] = {host: _rename(g) for host, g in host_to_leaf.items()}
+    return new_groups, new_parent_map, new_host_to_leaf
+
+
 def _auto_grouping_from_host_payloads(
     host_var_entries: list[tuple[str, dict[str, Any]]],
 ) -> tuple[dict[str, Any], dict[str, list[str]], dict[str, Optional[str]], dict[str, str]]:
@@ -1411,7 +1435,8 @@ def write_inventory(
     }
 
     for group_name, hosts in inventory_groups.get("hosts", {}).items():
-        merged_host_groups[group_name] = sorted(set(hosts))
+        if hosts:
+            merged_host_groups[group_name] = sorted(set(hosts))
     for group_name, children in inventory_groups.get("children", {}).items():
         merged_children_groups[group_name] = sorted(set(children))
 
@@ -1450,6 +1475,34 @@ def clear_owned_group_dirs(group_vars_root: str, group_paths: dict[str, str]) ->
             shutil.rmtree(absolute_root)
 
 
+def _merge_additive(target: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """Merge *source* into *target* without overriding existing content.
+
+    - Merge-directive keys (prefixed with ``_``) are inserted via ``setdefault``
+      so that existing directives are preserved.
+    - Keys absent from *target* are copied from *source*.
+    - Keys present in both as dicts are merged recursively.
+    - Keys present in both as lists: *target*'s list is kept intact; list-level
+      deduplication is delegated to the Ansible ``jtaf_apply_merge_directives``
+      filter at playbook runtime.
+    - Scalar keys already in *target*: *target* value wins.
+
+    This is used to propagate a foreign provider's delta to every group file
+    when the global shared payload shrinks (e.g., because a new provider was
+    added whose devices do not share some previously-global values).
+    """
+    result = copy.deepcopy(target)
+    for key, src_val in source.items():
+        if key.startswith("_"):
+            result.setdefault(key, copy.deepcopy(src_val))
+        elif key not in result:
+            result[key] = copy.deepcopy(src_val)
+        elif isinstance(src_val, dict) and isinstance(result[key], dict):
+            result[key] = _merge_additive(result[key], src_val)
+        # list or scalar already in target — keep target's value
+    return result
+
+
 def refresh_foreign_provider_root_payloads(
     group_vars_root: str,
     registry: dict[str, Any],
@@ -1458,15 +1511,26 @@ def refresh_foreign_provider_root_payloads(
     merge_profile: str,
     list_strategy_default: str,
 ) -> None:
-    """Refresh foreign provider root group payloads when shared all.yaml changes."""
+    """Refresh foreign provider group payloads when shared all.yaml changes.
+
+    When a new provider is added (or re-run), the global shared payload may
+    shrink: values that were previously global (e.g. ``notice: true`` under
+    ``system.syslog``) are no longer shared across all providers and fall out of
+    ``group_vars/all.yaml``.  These values must be distributed to *every* group
+    of the foreign provider — not only the root group — so that all devices
+    covered by that provider still receive them at render time.
+
+    The merge is additive: values already present in each group file are kept
+    (group-specific deltas are not overwritten), and only absent keys from the
+    provider-wide delta are inserted.
+    """
     providers = registry.get(PROVIDERS_KEY, {})
     for provider_key, entry in providers.items():
         if provider_key == active_provider_key:
             continue
-        root_group = entry.get("root_group")
         group_paths = entry.get("group_paths", {})
         shared_payload = entry.get("shared_payload", {})
-        if not isinstance(shared_payload, dict) or not root_group or root_group not in group_paths:
+        if not isinstance(shared_payload, dict) or not group_paths:
             continue
 
         delta = subtract_common(shared_payload, global_shared_payload)
@@ -1482,10 +1546,15 @@ def refresh_foreign_provider_root_payloads(
             merge_profile,
             list_strategy_default,
         ) if merge_profile != "off" else payload
-        write_group_all_payload(
-            os.path.join(group_vars_root, group_paths[root_group]),
-            hinted,
-        )
+
+        # Propagate the provider-wide delta to every group owned by this provider
+        # so that all devices get values that fell out of the global shared payload.
+        for _group_name, group_path in group_paths.items():
+            group_dir = os.path.join(group_vars_root, group_path)
+            existing = load_yaml_file(os.path.join(group_dir, ALL_YAML))
+            merged = _merge_additive(existing, hinted)
+            write_group_all_payload(group_dir, merged)
+
 
 
 def assign_provider_group_ranges(registry: dict[str, Any]) -> None:
@@ -1622,6 +1691,12 @@ def main() -> None:
         auto_inventory, common_groups, parent_map, host_to_leaf_group = _auto_grouping_from_host_payloads(
             active_host_delta_entries
         )
+        # Scope auto-generated group names to this provider to prevent directory
+        # collisions when multiple providers share the same output directory.
+        common_groups, parent_map, host_to_leaf_group = _prefix_group_names(
+            common_groups, parent_map, host_to_leaf_group, provider_key
+        )
+        auto_inventory = build_hierarchical_inventory_groups(parent_map, host_to_leaf_group)
         parsed_inventory = {
             "all": active_hostnames,
             "hosts": auto_inventory.get("hosts", {}),
@@ -1646,7 +1721,7 @@ def main() -> None:
     old_group_paths = old_entry.get("group_paths", {}) if isinstance(old_entry, dict) else {}
     old_group_names = old_entry.get("group_names", []) if isinstance(old_entry, dict) else []
     clear_owned_group_dirs(group_vars_dir, old_group_paths)
-    provider_path_prefix = sanitize_group_name(provider_key) if len(providers) > 1 else ""
+    provider_path_prefix = ""
     group_paths = write_group_hierarchy_payloads(
         group_vars_dir,
         parent_map,

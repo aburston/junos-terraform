@@ -79,6 +79,7 @@ class FilterModule:
         if isinstance(data, dict):
             # Check if this dict has a merge directive
             directive = data.get('_merge_directive')
+            merge_list_directives = data.get('_merge_list_directives', {})
 
             # Process nested structures first
             processed = {}
@@ -89,8 +90,16 @@ class FilterModule:
                 else:
                     processed[key] = self._process_directives(value)
 
-            # Apply directive if present (mostly for documentation/transparency)
-            # The actual merge behavior is handled at the Ansible combine level
+            # Apply _merge_list_directives: de-duplicate lists by key
+            for list_key, list_directive_config in merge_list_directives.items():
+                if list_key in processed and isinstance(processed[list_key], list):
+                    list_merge_directive = list_directive_config.get('_merge_directive')
+                    if list_merge_directive == 'merge_by_key':
+                        merge_key = list_directive_config.get('_merge_key', 'name')
+                        processed[list_key] = self._merge_list_by_key(
+                            processed[list_key], merge_key
+                        )
+
             if directive:
                 processed['_applied_directive'] = directive
 
@@ -100,6 +109,42 @@ class FilterModule:
             return [self._process_directives(item) for item in data]
 
         return data
+
+    @staticmethod
+    def _merge_list_by_key(lst: list, key: str) -> list:
+        """De-duplicate a list of dicts by a key field, merging duplicate entries.
+
+        Later entries (higher priority) override earlier entries for scalar values.
+        Sub-lists in merged items are recursively merged by the same key to handle
+        nested duplicates (e.g. syslog file contents).
+        Items lacking the key field are appended unchanged.
+        """
+        seen: Dict[Any, Any] = {}
+        order = []
+
+        for item in lst:
+            if isinstance(item, dict) and key in item:
+                k = item[key]
+                if k in seen:
+                    # Merge: later values take precedence; sub-lists merged by key
+                    merged = deepcopy(seen[k])
+                    for mk, mv in item.items():
+                        if isinstance(mv, list) and isinstance(merged.get(mk), list):
+                            merged[mk] = FilterModule._merge_list_by_key(
+                                merged[mk] + mv, key
+                            )
+                        else:
+                            merged[mk] = deepcopy(mv)
+                    seen[k] = merged
+                else:
+                    seen[k] = deepcopy(item)
+                    order.append(k)
+            else:
+                # Items without the key field are appended as-is
+                order.append(id(item))
+                seen[id(item)] = item
+
+        return [seen[k] for k in order]
 
 
 def _dispatch_merge(base: Any, override: Any, directive: Optional[str] = None) -> Any:

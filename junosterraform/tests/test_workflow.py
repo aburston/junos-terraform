@@ -220,7 +220,7 @@ def test_yang2ansible():
             f"Expected ansible files dir was not created: {ansible_files_dir}"
         )
 
-        group_vars_file = os.path.join(ansible_files_dir, "group_vars", "all.yml")
+        group_vars_file = os.path.join(ansible_files_dir, "group_vars", "all.yaml")
         assert os.path.exists(group_vars_file), (
             f"Expected group vars file not found: {group_vars_file}"
         )
@@ -234,14 +234,14 @@ def test_yang2ansible():
         derived_groups = re.findall(r"^\[([^\]]+)\]$", hosts_text, flags=re.MULTILINE)
         derived_groups = [group for group in derived_groups if group != "all"]
 
-        # Inventory derived groups should map to group_vars/<group>/all.yml
-        # in addition to group_vars/all.yml.
+        # Inventory derived groups should map to group_vars/<group>/all.yaml
+        # in addition to group_vars/all.yaml.
         for derived_group in derived_groups:
             group_vars_file_for_group = os.path.join(
                 ansible_files_dir,
                 "group_vars",
                 derived_group,
-                "all.yml",
+                "all.yaml",
             )
             assert os.path.exists(group_vars_file_for_group), (
                 f"Expected derived group vars file not found: {group_vars_file_for_group}"

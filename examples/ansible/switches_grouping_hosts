@@ -8,6 +8,10 @@ dc1-spine1
 dc1-spine2
 dc2-spine1
 dc2-spine2
+dc1-firewall1
+dc1-firewall2
+dc2-firewall1
+dc2-firewall2
 
 [dc1-borderleaf]
 dc1-borderleaf1
@@ -22,7 +26,15 @@ dc1-leaf3
 dc1-spine1
 dc1-spine2
 
-[dc2-spine]
+[dc2-leaf-spine]
 dc2-spine1
 dc2-spine2
+
+[dc1-firewall]
+dc1-firewall1
+dc1-firewall2
+
+[dc2-firewall]
+dc2-firewall1
+dc2-firewall2
 

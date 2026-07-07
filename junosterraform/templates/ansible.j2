@@ -82,7 +82,7 @@
 		{%- else -%}	
 
 {%- if ele.type == 'container' -%}
-{{'\n'+' '*4*level}}{{'{%-'}} if {{ nodevar }} is defined and (({{ nodevar }} is mapping and ({{ nodevar }}.values() | select | list | length > 0)) or ({{ nodevar }} is not mapping and {{ nodevar }})) {{'%}'}}
+{{'\n'+' '*4*level}}{{'{%-'}} if {{ nodevar }} is defined and (({{ nodevar }} is mapping and ({{ nodevar }} | length > 0)) or ({{ nodevar }} is not mapping and ({{ nodevar }} or {{ nodevar }} == ''))) {{'%}'}}
 {%- elif level>1 -%}
 {{'\n'+' '*4*level}}{{'{%-'}} if {{ nodevar }} is defined {{'%}'}}
 {%- else -%}

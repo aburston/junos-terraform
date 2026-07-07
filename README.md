@@ -400,6 +400,7 @@ Create `ansible-evpn-vxlan-deploy/ansible.cfg`:
 ```ini
 [defaults]
 roles_path = ../ansible-provider-junos-vqfx-evpn-vxlan/roles:../ansible-provider-junos-srx-ansible-role/roles
+filter_plugins = ../ansible-provider-junos-vqfx-evpn-vxlan/filter_plugins:../ansible-provider-junos-srx-ansible-role/filter_plugins
 host_key_checking = False
 ```
 
@@ -407,9 +408,9 @@ For first-time Ansible users: `roles_path` tells Ansible where custom roles live
 
 5. Create `grouping.hosts` files for the inventory hierarchy
 
-`jtaf-xml2yaml` now requires a grouping definition. The section names in these files become your generated inventory groups and `group_vars/<group>/all.yaml` directories.
+`jtaf-xml2yaml` now requires a grouping definition. The section names in these files become your generated inventory groups and `group_vars/<group>/all.yaml` directories. For a deeper look at the file format, merge behaviour, and multi-provider patterns, see [grouping-hosts-file.md](grouping-hosts-file.md).
 
-Create `ansible-evpn-vxlan-deploy/qfx.grouping.hosts`:
+Create `ansible-evpn-vxlan-deploy/grouping.hosts`:
 
 ```ini
 [all]
@@ -422,35 +423,33 @@ dc1-spine1
 dc1-spine2
 dc2-spine1
 dc2-spine2
-
-[borderleaf]
-dc1-borderleaf1
-dc1-borderleaf2
-
-[leaf]
-dc1-leaf1
-dc1-leaf2
-dc1-leaf3
-
-[spine]
-dc1-spine1
-dc1-spine2
-dc2-spine1
-dc2-spine2
-```
-
-Create `ansible-evpn-vxlan-deploy/firewall.grouping.hosts`:
-
-```ini
-[all]
 dc1-firewall1
 dc1-firewall2
 dc2-firewall1
 dc2-firewall2
 
-[firewall]
+[dc1-borderleaf]
+dc1-borderleaf1
+dc1-borderleaf2
+
+[dc1-leaf]
+dc1-leaf1
+dc1-leaf2
+dc1-leaf3
+
+[dc1-spine]
+dc1-spine1
+dc1-spine2
+
+[dc2-leafspine]
+dc2-spine1
+dc2-spine2
+
+[dc1-firewall]
 dc1-firewall1
 dc1-firewall2
+
+[dc2-firewall]
 dc2-firewall1
 dc2-firewall2
 ```
@@ -465,7 +464,7 @@ jtaf-xml2yaml \
 	-j ansible-provider-junos-vqfx-evpn-vxlan/trimmed_schema.json \
   -d ansible-evpn-vxlan-deploy \
   --hosts-file ansible-evpn-vxlan-deploy/inventory.ini \
-  --grouping-hosts-file ansible-evpn-vxlan-deploy/qfx.grouping.hosts
+  --grouping-hosts-file ansible-evpn-vxlan-deploy/grouping.hosts
 ```
 
 7. Generate inventory + vars for the second role into the same playbook project
@@ -476,7 +475,7 @@ jtaf-xml2yaml \
   -j ansible-provider-junos-srx-ansible-role/trimmed_schema.json \
   -d ansible-evpn-vxlan-deploy \
   --hosts-file ansible-evpn-vxlan-deploy/inventory.ini \
-  --grouping-hosts-file ansible-evpn-vxlan-deploy/firewall.grouping.hosts
+  --grouping-hosts-file ansible-evpn-vxlan-deploy/grouping.hosts
 ```
 
 After both runs, your playbook project should contain at least:
@@ -525,34 +524,52 @@ Create `ansible-evpn-vxlan-deploy/site.yml`:
 
 ```yaml
 ---
+- name: Prepare tmp_configs output directory
+  hosts: localhost
+  gather_facts: false
+  connection: local
+  tasks:
+    - name: Remove tmp_configs directory if it exists
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/tmp_configs"
+        state: absent
+
+    - name: Create tmp_configs directory
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/tmp_configs"
+        state: directory
+        mode: '0755'
+
 - name: Render XML from generated QFX role
-  hosts: borderleaf:leaf:spine
+  hosts: '~^dc\d+-(borderleaf|leaf|spine|leafspine)$'
   gather_facts: false
   connection: local
   vars:
-    tmp_dir: ../ansible-provider-junos-vqfx-evpn-vxlan/configs
+    tmp_dir: "tmp_configs"
+    jtaf_vars_root: "{{ playbook_dir }}"
   roles:
     - role: vqfx-evpn-vxlan_role
       delegate_to: localhost
 
 - name: Render XML from generated SRX role
-  hosts: firewall
+  hosts: '~^dc\d+-(firewall)$'
   gather_facts: false
   connection: local
   vars:
-    tmp_dir: ../ansible-provider-junos-srx-ansible-role/configs
+    tmp_dir: "tmp_configs"
+    jtaf_vars_root: "{{ playbook_dir }}"
   roles:
     - role: srx-ansible-role_role
       delegate_to: localhost
 
 - name: Preview and apply rendered XML on QFX devices
-  hosts: borderleaf:leaf:spine
+  hosts: '~^dc\d+-(borderleaf|leaf|spine|leafspine)$'
   gather_facts: false
   connection: local
   vars:
     netconf_user: "{{ lookup('env', 'NETCONF_USERNAME') }}"
     netconf_pass: "{{ lookup('env', 'NETCONF_PASSWORD') }}"
-    tmp_dir: ../ansible-provider-junos-vqfx-evpn-vxlan/configs
+    tmp_dir: "tmp_configs"
   tasks:
     - name: Preview candidate diff without committing
       juniper.device.config:
@@ -609,13 +626,13 @@ Create `ansible-evpn-vxlan-deploy/site.yml`:
           - "confirm={{ confirm_result.msg | default('no message') }}"
 
 - name: Preview and apply rendered XML on SRX devices
-  hosts: firewall
+  hosts: '~^dc\d+-(firewall)$'
   gather_facts: false
   connection: local
   vars:
     netconf_user: "{{ lookup('env', 'NETCONF_USERNAME') }}"
     netconf_pass: "{{ lookup('env', 'NETCONF_PASSWORD') }}"
-    tmp_dir: ../ansible-provider-junos-srx-ansible-role/configs
+    tmp_dir: "tmp_configs"
   tasks:
     - name: Preview candidate diff without committing (SRX)
       juniper.device.config:
@@ -628,6 +645,7 @@ Create `ansible-evpn-vxlan-deploy/site.yml`:
         check: true
         commit: false
         diff: true
+        timeout: 300
       register: preview_result_srx
 
     - name: Load and commit with commit-confirm safeguard (SRX)
@@ -641,6 +659,7 @@ Create `ansible-evpn-vxlan-deploy/site.yml`:
         confirmed: 5
         check_commit_wait: 5
         comment: "Apply SRX config generated by JTAF"
+        timeout: 300
       register: apply_result_srx
 ```
 
