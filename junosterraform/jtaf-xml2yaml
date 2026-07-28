@@ -112,8 +112,13 @@ def elem_to_dict(
             else:
                 result[prepared_tag].append(child.text)
         elif elem_type == "leaf-list":
-            # If the element is of type leaf-list, always create a list
-            result[prepared_tag] = child.text
+            # If the element is of type leaf-list, collect all values into a list
+            if prepared_tag not in result:
+                result[prepared_tag] = []
+            if child.text:
+                result[prepared_tag].append(child.text)
+            else:
+                result[prepared_tag].append(True)
         elif elem_type == "container":
             # If the element is of type container, always create a dict
             if len(child) > 0:
