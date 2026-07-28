@@ -77,9 +77,9 @@ if p1.returncode == 0 and pyang_out:
     p2 = subprocess.Popen([
         'jtaf-ansible',
         '-j', '-',
-        '-x', *xml_files,
         '-t', device_type,
-        '--mode', mode
+        '--mode', mode,
+        '-x', *xml_files
     ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     output, error = p2.communicate(input=pyang_out)
     print(output.decode(), file=sys.stdout)
