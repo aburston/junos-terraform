@@ -511,7 +511,7 @@ def test_elem_to_dict_list_leaflist_and_container(xml2yaml_mod):
 
     assert payload["interfaces"][0]["name"] == "et-0/0/0"
     assert payload["interfaces"][1]["description"] == "downlink"
-    assert payload["vlans"]["vlan_id"] == "100"
+    assert payload["vlans"]["vlan_id"] == ["100"]
 
 
 def test_element_node_returns_matching_schema_child(xml2yaml_mod):

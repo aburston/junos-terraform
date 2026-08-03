@@ -59,10 +59,13 @@ def element_node(
         The matching resource node or None if not found.
     """
 
-    if resources["name"] == element.tag and (
-        resources.get("path") is None or (resources["path"] + "/" + element.tag) == path
-    ):
-        return {k: v for k, v in resources.items() if k != "children"}
+    if resources["name"] == element.tag:
+        resource_path = resources.get("path")
+        if resource_path is None:
+            return {k: v for k, v in resources.items() if k != "children"}
+        expected = (resource_path + "/" + element.tag) if resource_path else element.tag
+        if expected == path:
+            return {k: v for k, v in resources.items() if k != "children"}
 
     try:
         for elem in resources["children"]:
