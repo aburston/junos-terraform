@@ -101,6 +101,10 @@ def elem_to_dict(
         resource_node = element_node(child, prepared_path, resources)
         elem_type = resource_node["type"] if resource_node else None
 
+        # Skip elements not defined in the YANG schema (same behavior as jtaf-xml2tf)
+        if elem_type is None:
+            continue
+
         if elem_type == "list":
             # If the element is of type list, always create a list
             if not result.get(prepared_tag):
@@ -125,18 +129,11 @@ def elem_to_dict(
                 result[prepared_tag] = elem_to_dict(child, prepared_path, resources)
             else:
                 result[prepared_tag] = ""
-        else:
-            # For other types, decide based on children
-            if len(child) > 0:
-                result[prepared_tag] = elem_to_dict(child, prepared_path, resources)
+        elif elem_type == "leaf":
+            if not child.text:
+                result[prepared_tag] = True
             else:
-                if elem_type == "leaf":
-                    if not child.text:
-                        result[prepared_tag] = True
-                    else:
-                        result[prepared_tag] = child.text
-                else:
-                    result[prepared_tag] = child.text
+                result[prepared_tag] = child.text
     return result
 
 
