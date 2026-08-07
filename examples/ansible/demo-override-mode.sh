@@ -20,8 +20,8 @@
 #
 # Usage:
 #   cd junos-terraform/examples/ansible
-#   export NETCONF_USERNAME='jcluser'
-#   export NETCONF_PASSWORD='Juniper!1'
+#   export NETCONF_USERNAME='{user}'
+#   export NETCONF_PASSWORD='{password}'
 #   # Then run each phase manually (copy/paste sections)
 #
 # =============================================================================
@@ -32,8 +32,8 @@ set -e
 # CONFIGURATION — Update these for your environment
 # =============================================================================
 
-NETCONF_USERNAME="${NETCONF_USERNAME:-jcluser}"
-NETCONF_PASSWORD="${NETCONF_PASSWORD:-Juniper!1}"
+NETCONF_USERNAME="${NETCONF_USERNAME:-{user}}"
+NETCONF_PASSWORD="${NETCONF_PASSWORD:-{password}}"
 YANG_COMMON="../yang/18.2/18.2R3/common"
 YANG_QFX="../yang/18.2/18.2R3/junos-qfx/conf/*.yang"
 DEVICE_TYPE="vqfx-override"
@@ -341,7 +341,7 @@ echo ">>> PHASE 7: Verify on device"
 echo ""
 echo "Run these commands on the device to verify:"
 echo ""
-echo "  ssh jcluser@100.123.24.3"
+echo "  ssh {user}@100.123.24.3"
 echo "  show system commit"
 echo "  show configuration | compare rollback 1"
 echo "  show snmp contact"
