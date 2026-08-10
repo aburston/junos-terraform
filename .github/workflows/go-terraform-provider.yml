@@ -29,6 +29,10 @@ jobs:
       run: |
         pytest -q netconf_mock/tests/test_netconf_mock_server.py
 
+    - name: Run jtaf-xml2tf unit tests
+      run: |
+        pytest -q junosterraform/tests/test_xml2tf_flatten.py
+
     - name: Set up Go
       uses: actions/setup-go@v6
       with:

@@ -105,7 +105,7 @@ go install .
 
 Run a command to generate a `.tf` test file to deploy the Terraform provider.
 
-**NOTE:** Output is written to a directory (`-d`) as `providers.tf` plus one `.tf` file per XML input.
+**NOTE:** When multiple XML files are provided, output includes `providers.tf`, a `common.tf` with shared config locals, and one `.tf` file per device. Use `--no-extract-common` to suppress `common.tf` and inline all values.
 
 **<u>Flag Options:</u>**
  * -j 
@@ -120,6 +120,8 @@ Run a command to generate a `.tf` test file to deploy the Terraform provider.
 	* **Optional:** Device username
  * -p
 	* **Optional:** Device password
+ * --no-extract-common
+	* **Optional:** Disable automatic extraction of shared config into `common.tf`. When set, all values are inlined per-device and no `common.tf` is written.
 
 
 ---
@@ -194,6 +196,8 @@ OR:
 
 ```
 /junos-terraform/<testing-folder-name>/	 <-- contents of jtaf-xml2tf command
+/junos-terraform/<testing-folder-name>/providers.tf
+/junos-terraform/<testing-folder-name>/common.tf         <-- shared config locals (auto-generated when 2+ XML files)
 /junos-terraform/<testing-folder-name>/dc1-borderleaf1.tf
 /junos-terraform/<testing-folder-name>/dc1-borderleaf2.tf
 /junos-terraform/<testing-folder-name>/dc1-leaf1.tf
