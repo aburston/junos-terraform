@@ -4,6 +4,7 @@ import json
 from copy import deepcopy
 from lxml import etree
 import sys
+import hashlib
 import re
 import os
 from xml.etree import ElementTree
@@ -11,11 +12,21 @@ from junosterraform.jtaf_common import build_type_map, normalize_tag
 
 missing_xpaths = set()
 
+
+class HCLRef:
+    """Wraps a bare HCL expression that is emitted without quotes (e.g. local.foo)."""
+
+    def __init__(self, ref: str):
+        self.ref = ref
+
+
 def convert_to_hcl(value, indent=2):
     """
     Converts Python dictionary or list into Terraform-compatible HCL syntax.
     """
     spaces = " " * indent
+    if isinstance(value, HCLRef):
+        return value.ref
     if isinstance(value, dict):
         return "{\n" + "\n".join([f'{spaces}{k} = {convert_to_hcl(v, indent + 2)}' for k, v in value.items()]) + f'\n{spaces[:-2]}}}'
     elif isinstance(value, list):
@@ -238,10 +249,64 @@ def merge_parsed_values(base_value, overlay_value):
     return deepcopy(overlay_value)
 
 
+def emit_hcl_value(value, path, hostname, extraction_points, indent=2):
+    """
+    Path-aware HCL value emitter. Mirrors convert_to_hcl() but checks extraction_points
+    at each dict key and named-list item before recursing, emitting local.<name>
+    references in place of identical sub-trees found by walk_and_extract().
+
+    `path` is the path tuple of the current value (e.g. ("system", "login")).
+    `hostname` is the current device name, used to look up per-device extraction points.
+    `indent` has the same meaning as in convert_to_hcl: indentation for child items.
+    """
+    spaces = " " * indent
+
+    if isinstance(value, HCLRef):
+        return value.ref
+
+    if isinstance(value, dict):
+        parts = []
+        for k, v in value.items():
+            child_path = path + (k,)
+            if extraction_points and (hostname, child_path) in extraction_points:
+                parts.append(f'{spaces}{k} = local.{extraction_points[(hostname, child_path)]}')
+            else:
+                child_hcl = emit_hcl_value(v, child_path, hostname, extraction_points, indent + 2)
+                parts.append(f'{spaces}{k} = {child_hcl}')
+        return "{\n" + "\n".join(parts) + f'\n{spaces[:-2]}}}'
+
+    if isinstance(value, list):
+        item_parts = []
+        for item in value:
+            if isinstance(item, dict):
+                name = item.get("name")
+                if name is not None:
+                    item_path = path + (f"[{name}]",)
+                    if extraction_points and (hostname, item_path) in extraction_points:
+                        item_parts.append(spaces + f"local.{extraction_points[(hostname, item_path)]}")
+                        continue
+                else:
+                    item_path = path  # anonymous single-item block — path unchanged
+                item_hcl = emit_hcl_value(item, item_path, hostname, extraction_points, indent + 2)
+                item_parts.append(spaces + item_hcl)
+            else:
+                item_parts.append(spaces + convert_to_hcl(item, indent + 2))
+        return "[\n" + ",\n".join(item_parts) + f'\n{spaces[:-2]}]'
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return f'"{value}"'
+
+
 # Generates a Terraform-style resource block for the given parsed data.
-def generate_hcl_resources(parsed_data, device_type, hostname):
+def generate_hcl_resources(parsed_data, device_type, hostname, extraction_points=None):
     """
     Generates a single Terraform-style resource block targeting the device base configuration.
+
+    When extraction_points is provided (produced by walk_and_extract), config values at
+    matching path tuples are emitted as local.<name> references instead of being inlined.
     """
     resource_block = ""
 
@@ -250,64 +315,57 @@ def generate_hcl_resources(parsed_data, device_type, hostname):
     resource_block += f'  provider = junos-{device_type}.{hostname.replace("-", "_")}\n'
 
     for key, value in parsed_data.items():
-        hcl_value = convert_to_hcl(value, indent=4)
-        resource_block += f'  {key} = {hcl_value}\n'
+        top_path = (key,)
+        if extraction_points and (hostname, top_path) in extraction_points:
+            resource_block += f'  {key} = local.{extraction_points[(hostname, top_path)]}\n'
+        else:
+            hcl_value = emit_hcl_value(value, top_path, hostname, extraction_points, indent=4)
+            resource_block += f'  {key} = {hcl_value}\n'
 
     resource_block += "}\n"
     return resource_block
 
 
-def parse_xml_to_hcl(xml_file, device_type, hostname, type_lookup):
+def _parse_xml_to_dict(xml_file, type_lookup):
     """
-    Parses an XML file and converts it to Terraform-style HCL resources.
-    Starts from <configuration> if under <rpc-reply> and removes <version> if present.
+    Parse a Junos XML config file into a normalized Python dict.
+
+    Handles <rpc-reply>/<configuration> wrapping, <apply-groups>, <groups>,
+    and <version> removal. Returns the merged config dict or None on error.
     """
     try:
-        # Read the XML file content
         with open(xml_file, 'r') as file:
             xml_content = file.read()
 
-        # Capture explicitly empty tags (e.g. <foo></foo>)
         explicit_empty_tags = set()
         for match in re.finditer(r"<(\w[\w\-]*)>\s*</\1>", xml_content):
             explicit_empty_tags.add(match.group(1))
 
-        # Wrap with a temporary root to ensure well-formedness
         wrapped_xml = f"<root>{xml_content}</root>"
         root = etree.fromstring(wrapped_xml)
 
-        # Try to find the <configuration> node under <rpc-reply>
         config_node = root.find(".//configuration")
         if config_node is not None:
-            # Replace root with configuration node
             root = config_node
-        
+
         groups = {}
         apply_groups = []
 
-        # Extract and remove <apply-groups>
         for ag in root.findall('./apply-groups'):
             if ag.text:
                 apply_groups.append(ag.text.strip())
             root.remove(ag)
 
-        # Extract and remove <groups>
-        groups_elem = root.findall('./groups')
-        for group in groups_elem:
+        for group in root.findall('./groups'):
             group_name_elem = group.find('./name')
             if group_name_elem is not None:
-                group_name = group_name_elem.text.strip()
-                groups[group_name] = group
+                groups[group_name_elem.text.strip()] = group
             root.remove(group)
 
-        # Remove any <version> tag directly under root
         version_node = root.find("./version")
         if version_node is not None:
             root.remove(version_node)
 
-        # Parse elements starting from the new root
-        resources = []
-        # Build base resource from root-level config and flatten any applied groups into it.
         base_data = {}
         for elem in root:
             tag = normalize_tag(elem.tag)
@@ -323,7 +381,6 @@ def parse_xml_to_hcl(xml_file, device_type, hostname, type_lookup):
             group_node = groups.get(group_name)
             if group_node is None:
                 continue
-
             group_data = {}
             for elem in group_node:
                 tag = normalize_tag(elem.tag)
@@ -333,17 +390,254 @@ def parse_xml_to_hcl(xml_file, device_type, hostname, type_lookup):
                 if value is None:
                     continue
                 group_data[tag] = value
-
             applied_group_data = merge_parsed_values(applied_group_data, group_data)
 
-        final_data = merge_parsed_values(applied_group_data, base_data)
-        resources.append(generate_hcl_resources(final_data, device_type, hostname))
-
-        return "\n".join(resources)
+        return merge_parsed_values(applied_group_data, base_data)
 
     except Exception as e:
-        print(f"Error parsing XML: {e}")
+        print(f"Error parsing XML {xml_file}: {e}")
         return None
+
+
+def parse_xml_to_hcl(xml_file, device_type, hostname, type_lookup):
+    """
+    Parses an XML file and converts it to Terraform-style HCL resources.
+    Starts from <configuration> if under <rpc-reply> and removes <version> if present.
+    """
+    final_data = _parse_xml_to_dict(xml_file, type_lookup)
+    if final_data is None:
+        return None
+    return generate_hcl_resources(final_data, device_type, hostname)
+
+def _sanitize_local_name(name):
+    """Replace hyphens and other non-identifier characters with underscores."""
+    return re.sub(r'[^a-zA-Z0-9_]', '_', name)
+
+
+def get_at_path(data, path_tuple):
+    """
+    Navigate a nested config dict using a path tuple.
+
+    Path components:
+    - Plain string key: navigates into a dict. If the current value is a
+      single-item list of dict, it is auto-unwrapped before the key lookup.
+    - "[name]" string: finds the item in a list of dicts where item["name"] == name.
+
+    Returns None if the path does not exist in the data.
+    """
+    current = data
+    for component in path_tuple:
+        if current is None:
+            return None
+        if isinstance(component, str) and component.startswith("[") and component.endswith("]"):
+            name = component[1:-1]
+            if not isinstance(current, list):
+                return None
+            current = next(
+                (item for item in current if isinstance(item, dict) and item.get("name") == name),
+                None,
+            )
+        elif isinstance(current, list):
+            if len(current) == 1 and isinstance(current[0], dict):
+                current = current[0].get(component)
+            else:
+                return None
+        elif isinstance(current, dict):
+            current = current.get(component)
+        else:
+            return None
+    return current
+
+
+def walk_and_extract(parsed_by_host):
+    """
+    Recursively find shared sub-trees across provided device configs.
+
+    At each path, devices are grouped by identical value. Any group of 2+ devices
+    sharing the same value is extracted as a common local variable:
+      - All devices identical  -> "common_<path>" (no device qualifier)
+      - Subset of 2+ devices   -> "common_g_<hash>_<path>" where <hash> is the first
+        6 hex chars of SHA-256 over the sorted, comma-joined device names in the group.
+
+    Devices captured at a parent path are excluded from further extraction at child
+    paths, preventing unreferenced child-level locals from being emitted.
+
+    Returns:
+        shared_locals:      dict mapping local variable name -> value
+        extraction_points:  dict mapping (hostname, path_tuple) -> local variable name
+        group_members:      dict mapping 6-char group hash -> sorted list of hostnames
+    """
+    shared_locals = {}      # local_var_name -> value
+    extraction_points = {}  # (hostname, path_tuple) -> local_var_name
+    group_members = {}      # 6-char hash -> sorted list of hostnames
+    total_devices = len(parsed_by_host)
+
+    def _local_name(path_tuple):
+        parts = []
+        for p in path_tuple:
+            if p.startswith("[") and p.endswith("]"):
+                parts.append(_sanitize_local_name(p[1:-1]))
+            else:
+                parts.append(_sanitize_local_name(p))
+        return "common_" + "_".join(parts)
+
+    def _group_hash(hostnames_sorted):
+        key = ",".join(hostnames_sorted)
+        return hashlib.sha256(key.encode()).hexdigest()[:6]
+
+    def _group_local_name(path_tuple, hostnames_sorted):
+        h = _group_hash(hostnames_sorted)
+        path_seg = "_".join(
+            _sanitize_local_name(p[1:-1] if p.startswith("[") and p.endswith("]") else p)
+            for p in path_tuple
+        )
+        return f"common_g_{h}_{path_seg}"
+
+    def _walk(path_tuple, excluded_hosts=None):
+        if excluded_hosts is None:
+            excluded_hosts = frozenset()
+
+        active_hosts = [h for h in parsed_by_host if h not in excluded_hosts]
+        if len(active_hosts) < 2:
+            return
+
+        values_map = {}
+        for hostname in active_hosts:
+            v = get_at_path(parsed_by_host[hostname], path_tuple)
+            if v is not None:
+                values_map[hostname] = v
+
+        if len(values_map) < 2:
+            return
+
+        # Group active hosts by canonical (JSON-serialized) value
+        by_canonical = {}
+        for h, v in values_map.items():
+            try:
+                key = json.dumps(v, sort_keys=True)
+            except (TypeError, ValueError):
+                continue
+            by_canonical.setdefault(key, []).append(h)
+
+        newly_extracted = set()
+
+        for canonical_str, hostnames in by_canonical.items():
+            if len(hostnames) < 2:
+                continue
+            hostnames_sorted = sorted(hostnames)
+            v = json.loads(canonical_str)
+
+            if len(hostnames) == total_devices:
+                lname = _local_name(path_tuple)
+            else:
+                h = _group_hash(hostnames_sorted)
+                lname = _group_local_name(path_tuple, hostnames_sorted)
+                group_members[h] = hostnames_sorted
+
+            shared_locals[lname] = v
+            for hostname in hostnames_sorted:
+                extraction_points[(hostname, path_tuple)] = lname
+            newly_extracted.update(hostnames_sorted)
+
+        # Recurse into anonymous container children for hosts not captured at this level.
+        # Hosts extracted at this level are excluded so child locals are never orphaned.
+        next_excluded = excluded_hosts | frozenset(newly_extracted)
+        remaining = {h: values_map[h] for h in values_map if h not in newly_extracted}
+
+        if len(remaining) < 2:
+            return
+
+        unwrapped = []
+        for v in remaining.values():
+            if isinstance(v, dict) and v.get("name") is None:
+                unwrapped.append(v)
+            elif (
+                isinstance(v, list)
+                and len(v) == 1
+                and isinstance(v[0], dict)
+                and v[0].get("name") is None
+            ):
+                unwrapped.append(v[0])
+            else:
+                unwrapped = []
+                break
+
+        if unwrapped:
+            child_keys = set()
+            for d in unwrapped:
+                child_keys.update(d.keys())
+            for key in sorted(child_keys):
+                _walk(path_tuple + (key,), excluded_hosts=next_excluded)
+        elif all(
+            isinstance(v, list) and v and all(isinstance(i, dict) and "name" in i for i in v)
+            for v in remaining.values()
+        ):
+            # Named-object list: recurse into each item individually by name
+            all_names = set()
+            for v in remaining.values():
+                all_names.update(str(i["name"]) for i in v)
+            for item_name in sorted(all_names):
+                _walk(path_tuple + (f"[{item_name}]",), excluded_hosts=next_excluded)
+        elif all(isinstance(v, dict) for v in remaining.values()):
+            # Named-item dict (e.g. a BGP group object): recurse into structural fields.
+            # Skip "name" (it's the key identifier) and bare scalars (not worth extracting).
+            child_keys = set()
+            for d in remaining.values():
+                for k, v in d.items():
+                    if k != "name" and isinstance(v, (dict, list)):
+                        child_keys.add(k)
+            for key in sorted(child_keys):
+                _walk(path_tuple + (key,), excluded_hosts=next_excluded)
+
+    all_keys = set()
+    for data in parsed_by_host.values():
+        all_keys.update(data.keys())
+    for key in sorted(all_keys):
+        _walk((key,))
+
+    return shared_locals, extraction_points, group_members
+
+
+def generate_locals_block(locals_map, group_members=None):
+    """
+    Generate a single HCL locals block from shared config values.
+
+    All-device shared locals are emitted first under a section comment.
+    Subset-shared locals (names starting with "common_g_") are clustered
+    by group hash under a comment header that lists the member devices.
+    """
+    if not locals_map:
+        return ""
+
+    all_device = {n: v for n, v in locals_map.items() if not n.startswith("common_g_")}
+    group_specific = {n: v for n, v in locals_map.items() if n.startswith("common_g_")}
+
+    lines = ["locals {"]
+
+    if all_device:
+        lines.append("  # ── Shared by all devices ────────────────────────────────────────────────")
+        for local_name, value in sorted(all_device.items()):
+            hcl_value = convert_to_hcl(value, indent=4)
+            lines.append(f"  {local_name} = {hcl_value}")
+
+    if group_specific:
+        by_hash = {}
+        for name, value in group_specific.items():
+            m = re.match(r"^common_g_([0-9a-f]{6})_", name)
+            h = m.group(1) if m else ""
+            by_hash.setdefault(h, {})[name] = value
+
+        for h in sorted(by_hash.keys()):
+            members = (group_members or {}).get(h, [])
+            members_str = ", ".join(members)
+            lines.append(f"\n  # ── Group {h}: {members_str} ────────────────────────────────────────────────")
+            for local_name, value in sorted(by_hash[h].items()):
+                hcl_value = convert_to_hcl(value, indent=4)
+                lines.append(f"  {local_name} = {hcl_value}")
+
+    lines.append("}\n")
+    return "\n".join(lines)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -379,6 +673,18 @@ def main():
     ## Add optional options to take in username and password
     parser.add_argument('-u', '--username', help='Username to place in generated provider blocks.')
     parser.add_argument('-p', '--password', help='Password to place in generated provider blocks.')
+    parser.add_argument(
+        '--no-extract-common',
+        action='store_true',
+        default=False,
+        help=(
+            'Disable automatic common-variable extraction. When set, all values are emitted '
+            'inline in per-device .tf files and no common.tf is written. '
+            'By default the tool analyses all provided XML files, extracts identical config '
+            'sub-trees into common.tf as locals, and emits local.<name> references in '
+            'per-device files.'
+        ),
+    )
     args = parser.parse_args()
 
     trimmed_json_file = args.trimmed_json
@@ -432,29 +738,91 @@ def main():
         with open(provider_file, "w") as f:
             f.write(provider_block)
 
-    for file in xml_files:
-        print(f"\nProcessing XML file: {file}")
-        hostname = file.split("/")[-1].split(".")[0]
-        head_block = create_head_block(device_type, hostname, username, password)
-        if head_block:
-            with open(provider_file, "r") as f:
-                existing = f.read()
+    # --- Automatic two-pass extraction mode ---
+    if not args.no_extract_common and len(xml_files) > 1:
+        # Pass 1: parse all XML files into dicts
+        print("\n[Pass 1] Parsing all XML configs...")
+        parsed_by_host = {}
+        hostname_by_file = {}
+        for file in xml_files:
+            hostname = file.split("/")[-1].split(".")[0]
+            hostname_by_file[file] = hostname
+            parsed_dict = _parse_xml_to_dict(file, type_lookup)
+            if parsed_dict is not None:
+                parsed_by_host[hostname] = parsed_dict
 
-            # Append only if hostname NOT already in providers.tf
-            if hostname not in existing:
-                with open(provider_file, "a") as f:
-                    f.write("\n" + head_block)
-            else:
-                print(f"\n  -> Skipping provider block for hostname '{hostname}' (already exists).\n")
+        # Pass 2: deep shared sub-tree analysis across all devices
+        print("\n[Pass 2] Analysing shared config sub-trees across all devices...")
+        shared_locals, extraction_points, group_members = walk_and_extract(parsed_by_host)
 
-        # Write per-device .tf file
-        hcl_output = parse_xml_to_hcl(file, device_type, hostname, type_lookup)
-        if hcl_output:
+        if shared_locals:
+            print(f"  Found {len(shared_locals)} shared local(s):")
+            for lname in sorted(shared_locals):
+                print(f"    - {lname}")
+            common_file = f"{directory}/common.tf"
+            with open(common_file, "w") as f:
+                f.write(generate_locals_block(shared_locals, group_members))
+            print(f"\n  ---> Wrote common locals to {common_file}")
+        else:
+            print("  No shared config sub-trees found — all values are device-specific.")
+            extraction_points = {}
+
+        # Pass 3: write per-device .tf files with local.<name> references
+        print("\n[Pass 3] Writing per-device .tf files...")
+        for file in xml_files:
+            hostname = hostname_by_file[file]
+            print(f"\nProcessing XML file: {file}")
+
+            head_block = create_head_block(device_type, hostname, username, password)
+            if head_block:
+                with open(provider_file, "r") as f:
+                    existing = f.read()
+                if hostname not in existing:
+                    with open(provider_file, "a") as f:
+                        f.write("\n" + head_block)
+                else:
+                    print(f"\n  -> Skipping provider block for hostname '{hostname}' (already exists).\n")
+
+            parsed_data = parsed_by_host.get(hostname)
+            if parsed_data is None:
+                print(f"  [WARN] No parsed data for {hostname}, skipping.")
+                continue
+
+            hcl_output = generate_hcl_resources(
+                parsed_data, device_type, hostname,
+                extraction_points=extraction_points,
+            )
             filename = f"{directory}/{hostname}.tf"
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             with open(filename, "w") as f:
                 f.write(hcl_output)
             print(f"   --->  DONE: Wrote output to {filename}\n")
+
+    else:
+        # --- Single-pass mode (single file or --no-extract-common) ---
+        for file in xml_files:
+            print(f"\nProcessing XML file: {file}")
+            hostname = file.split("/")[-1].split(".")[0]
+            head_block = create_head_block(device_type, hostname, username, password)
+            if head_block:
+                with open(provider_file, "r") as f:
+                    existing = f.read()
+
+                # Append only if hostname NOT already in providers.tf
+                if hostname not in existing:
+                    with open(provider_file, "a") as f:
+                        f.write("\n" + head_block)
+                else:
+                    print(f"\n  -> Skipping provider block for hostname '{hostname}' (already exists).\n")
+
+            # Write per-device .tf file (all values inline)
+            hcl_output = parse_xml_to_hcl(file, device_type, hostname, type_lookup)
+            if hcl_output:
+                filename = f"{directory}/{hostname}.tf"
+                os.makedirs(os.path.dirname(filename), exist_ok=True)
+                with open(filename, "w") as f:
+                    f.write(hcl_output)
+                print(f"   --->  DONE: Wrote output to {filename}\n")
 
 if __name__ == "__main__":
     main()
