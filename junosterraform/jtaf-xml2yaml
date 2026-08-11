@@ -59,10 +59,13 @@ def element_node(
         The matching resource node or None if not found.
     """
 
-    if resources["name"] == element.tag and (
-        resources.get("path") is None or (resources["path"] + "/" + element.tag) == path
-    ):
-        return {k: v for k, v in resources.items() if k != "children"}
+    if resources["name"] == element.tag:
+        resource_path = resources.get("path")
+        if resource_path is None:
+            return {k: v for k, v in resources.items() if k != "children"}
+        expected = (resource_path + "/" + element.tag) if resource_path else element.tag
+        if expected == path:
+            return {k: v for k, v in resources.items() if k != "children"}
 
     try:
         for elem in resources["children"]:
@@ -101,6 +104,10 @@ def elem_to_dict(
         resource_node = element_node(child, prepared_path, resources)
         elem_type = resource_node["type"] if resource_node else None
 
+        # Skip elements not defined in the YANG schema (same behavior as jtaf-xml2tf)
+        if elem_type is None:
+            continue
+
         if elem_type == "list":
             # If the element is of type list, always create a list
             if not result.get(prepared_tag):
@@ -112,26 +119,24 @@ def elem_to_dict(
             else:
                 result[prepared_tag].append(child.text)
         elif elem_type == "leaf-list":
-            # If the element is of type leaf-list, always create a list
-            result[prepared_tag] = child.text
+            # If the element is of type leaf-list, collect all values into a list
+            if prepared_tag not in result:
+                result[prepared_tag] = []
+            if child.text:
+                result[prepared_tag].append(child.text)
+            else:
+                result[prepared_tag].append(True)
         elif elem_type == "container":
             # If the element is of type container, always create a dict
             if len(child) > 0:
                 result[prepared_tag] = elem_to_dict(child, prepared_path, resources)
             else:
                 result[prepared_tag] = ""
-        else:
-            # For other types, decide based on children
-            if len(child) > 0:
-                result[prepared_tag] = elem_to_dict(child, prepared_path, resources)
+        elif elem_type == "leaf":
+            if not child.text:
+                result[prepared_tag] = True
             else:
-                if elem_type == "leaf":
-                    if not child.text:
-                        result[prepared_tag] = True
-                    else:
-                        result[prepared_tag] = child.text
-                else:
-                    result[prepared_tag] = child.text
+                result[prepared_tag] = child.text
     return result
 
 

@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-06-17
+
+### Added
+- NETCONF patch engine (`terraform_provider/patch/`) — computes minimal leaf-level diffs and emits targeted `edit-config` operations instead of full configuration replacement
+- Schema-aware leaf map flattening using YANG schema (`trimmed_schema.json`) for correct list key detection, leaf type handling, and ordered leaf-list support
+- XML element order stabilization (`AlignXMLOrderToReference`) — eliminates phantom diffs caused by non-deterministic Junos `get-config` element ordering
+- UTF-8 double-encoding repair (`NormalizeLeafMapUTF8`) — fixes false diffs caused by multi-byte characters (e.g., em-dash) being double-encoded through Go XML marshal/unmarshal cycles
+- Container delete coalescing — replaces N individual leaf deletes with a single container-level `nc:operation="delete"` when all children are being removed
+- Ordered leaf-list position tracking — detects reordering of `ordered-by user` leaf-lists (e.g., VRRP virtual-address) using positional keys `[pos=N]`
+- Fallback safety net — if patch verification detects residual differences, emits a Terraform warning and falls back to full replace
+- `SendUpdate` and `SendDirectTransaction` NETCONF client methods for `edit-config` and group-less `load-configuration` RPCs
+- 57+ new Go unit tests covering all YANG node kinds, CRUD operation permutations, and 10 validated corner cases
+
+### Changed
+- Update operation now uses minimal diff/patch (`edit-config` with per-element `nc:operation`) instead of full group replacement (`load-configuration`)
+- Delete operation now uses targeted per-leaf/container deletes instead of group deletion
+- Configuration model changed from apply-groups wrapping to direct base configuration
+- Read operation now stabilizes XML element ordering to prevent spurious diffs
+
+### Fixed
+- Phantom diffs from XML element order variation across `get-config` reads
+- UTF-8 encoding drift causing false `terraform plan` changes on strings with special characters
+- Silent fallback to full replace now emits Terraform warning diagnostics
+- Ordered leaf-list reorder detection (previously invisible due to set semantics)
+- Container deletion generating excessive individual leaf delete operations
+
 ## [1.1.0] - 2025-10-03
  
 ### Added
