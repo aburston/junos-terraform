@@ -65,3 +65,43 @@ class TestXMLToTerraformFlatten(unittest.TestCase):
         self.assertIn("ssh = [", rendered)
         self.assertNotIn("unused", rendered)
         self.assertNotIn("telnet", rendered)
+
+    def test_common_tf_created_with_locals_for_shared_config(self):
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        script_path = os.path.join(repo_root, "junosterraform", "jtaf-xml2tf")
+
+        loader = SourceFileLoader("jtaf_xml2tf", script_path)
+        spec = importlib.util.spec_from_loader("jtaf_xml2tf", loader)
+        assert spec is not None
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+
+        # Synthetic parsed dicts — no XML or type_lookup needed.
+        # "shared_key" is identical on both devices; "host_name" is device-specific.
+        parsed_by_host = {
+            "device1": {"host_name": "device1", "shared_key": [{"value": "same"}]},
+            "device2": {"host_name": "device2", "shared_key": [{"value": "same"}]},
+        }
+
+        shared_locals, extraction_points, group_members = module.walk_and_extract(parsed_by_host)
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            common_tf_path = os.path.join(output_dir, "common.tf")
+            with open(common_tf_path, "w") as f:
+                f.write(module.generate_locals_block(shared_locals, group_members))
+
+            for hostname, parsed_data in parsed_by_host.items():
+                hcl = module.generate_hcl_resources(
+                    parsed_data, "vmx", hostname, extraction_points
+                )
+                with open(os.path.join(output_dir, f"{hostname}.tf"), "w") as f:
+                    f.write(hcl)
+
+            self.assertTrue(os.path.exists(common_tf_path))
+            self.assertIn("locals {", open(common_tf_path).read())
+
+            for hostname in parsed_by_host:
+                device_tf = os.path.join(output_dir, f"{hostname}.tf")
+                self.assertTrue(os.path.exists(device_tf))
+                self.assertIn("local.", open(device_tf).read())
